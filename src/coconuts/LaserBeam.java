@@ -18,6 +18,8 @@ public class LaserBeam extends IslandObject {
 
     @Override
     public void step() {
-        y -= 3;
+        final int SPEED = 3;   // try 2 if you want even slower
+        y -= SPEED;
     }
+
 }
