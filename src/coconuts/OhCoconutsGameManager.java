@@ -1,139 +1,213 @@
 package coconuts;
 
 import javafx.scene.layout.Pane;
+import javafx.scene.image.ImageView;
+
 import java.util.Collection;
 import java.util.LinkedList;
 import java.util.List;
 
-/** Manages island objects, collisions, and hit notifications. */
+/**
+ * Manages island objects, collisions, and hit notifications.
+ * Implements a simple Subject (Observer pattern) so the ScoreBoard
+
+ * Core loop each tick:
+ *  1) step() all objects,
+ *  2) detect collisions and publish events,
+ *  3) queue and remove any objects to delete.
+ */
 public class OhCoconutsGameManager implements Subject {
 
     // --- Collections of game objects ---
-    private final Collection<IslandObject> allObjects          = new LinkedList<>();
-    private final Collection<HittableIslandObject> hittables   = new LinkedList<>();
-    private final Collection<IslandObject> scheduledForRemoval = new LinkedList<>();
+    private final Collection<IslandObject>        allObjects         = new LinkedList<>();
+    private final Collection<HittableIslandObject> hittables         = new LinkedList<>();
+    private final Collection<IslandObject>        scheduledForRemoval= new LinkedList<>();
 
     // --- World + UI ---
     private final int height, width;
-    private final int DROP_INTERVAL = 10;
-    private final int MAX_TIME = 100;
     private final Pane gamePane;
 
-    // --- Key actors ---
     private Crab  theCrab;
     private Beach theBeach;
-    private ScoreBoard scoreboard;
-
 
     // --- Tick state ---
     private int coconutsInFlight = 0;
-    private int gameTick = 0;
+    private int gameTick         = 0;
+    private static final int DROP_INTERVAL = 10;     // lower = more coconuts
+    private static final int MAX_TIME      = 10_000;
 
     // --- Observer hub (Subject impl) ---
     private final List<Observer> observers = new LinkedList<>();
-    //private final ScoreBoard scoreboard = new ScoreBoard();
+    private ScoreBoard scoreboard;                   // HUD (observer)
 
+    // --- Game-over state ---
+    private boolean gameOver = false;
+    public boolean isGameOver() { return gameOver; }
+
+    /** One-shot transition to game over; also triggers the final overlay. */
+    private void triggerGameOver() {
+        if (gameOver) return;
+        gameOver = true;
+        showFinalScore();      // show the big overlay from ScoreBoard
+    }
+
+    // ------------------------------------------------------------------------
+    // Constructor
+    // ------------------------------------------------------------------------
     public OhCoconutsGameManager(int height, int width, Pane gamePane) {
-        this.height = height;
-        this.width  = width;
+        this.height  = height;
+        this.width   = width;
         this.gamePane = gamePane;
 
-        // Create & register core objects
+        // Attach ScoreBoard HUD (top-left)
+        this.scoreboard = new ScoreBoard();
+        attach(scoreboard);
+        if (scoreboard.getMiniLabel() != null) {
+            gamePane.getChildren().add(scoreboard.getMiniLabel());
+        }
+
+        // Crab (centered) and Beach
         theCrab = new Crab(this, height, width);
         registerObject(theCrab);
         gamePane.getChildren().add(theCrab.getImageView());
 
-        notifyObservers("LASER_HIT_COCONUT");
-
-
         theBeach = new Beach(this, height, width);
         registerObject(theBeach);
-        if (theBeach.getImageView() != null) {
-            System.out.println("Unexpected image view for beach");
-        }
-
-        // Attach ScoreBoard observer
-        this.scoreboard = new ScoreBoard(gamePane, this);  // pass gamePane to place label
-        attach(scoreboard);
-        System.out.println("✅ ScoreBoard attached to GameManager!");
+        // beach has no image view (domain-only), so no add to pane
     }
 
-    // ---- Subject implementation ----
-    @Override public void attach(Observer o) { observers.add(o); }
+    // ------------------------------------------------------------------------
+    // Subject implementation
+    // ------------------------------------------------------------------------
+    @Override
+    public void attach(Observer o) { observers.add(o); }
 
-    @Override public void detach(Observer o) { observers.remove(o); }
+    @Override
+    public void detach(Observer o) { observers.remove(o); }
 
-    @Override public void notifyObservers(Object event) {
+    @Override
+    public void notifyObservers(Object event) {
         for (Observer o : observers) o.update(event);
     }
 
-    // Backwards-compat if you already called notifyAllObservers(...)
-    public void notifyAllObservers(Object event) {
-        notifyObservers(event);
-    }
+    // ------------------------------------------------------------------------
+    // Public API used by controller/timeline
+    // ------------------------------------------------------------------------
 
-
-    // ---- Object registration ----
-    private void registerObject(IslandObject obj) {
-        allObjects.add(obj);
-        if (obj.isHittable()) {              // no instanceof
-            hittables.add((HittableIslandObject) obj); // safe cast by contract
-        }
-    }
-
-    public void scheduleForDeletion(IslandObject obj) { scheduledForRemoval.add(obj); }
-
-    // ---- Spawning / ticks ----
+     //Adds it to collections and attaches its ImageView to the pane
     public void tryDropCoconut() {
         if (gameTick % DROP_INTERVAL == 0 && theCrab != null) {
-            coconutsInFlight++;
+            coconutsInFlight += 1;
             Coconut c = new Coconut(this, (int) (Math.random() * width));
             registerObject(c);
-            gamePane.getChildren().add(c.getImageView());
+            ImageView iv = c.getImageView();
+            if (iv != null) gamePane.getChildren().add(iv);
         }
         gameTick++;
     }
 
-    public void coconutDestroyed() { coconutsInFlight--; }
-
+    //Moves objects, checks collisions, and cleans up
     public void advanceOneTick() {
-        // check hits
+        // 1) Move everything one step
+        for (IslandObject obj : allObjects) {
+            obj.step();
+        }
+
+        // 2) Check hits (no instanceof): let objects declare their own rules
         for (IslandObject actor : allObjects) {
             for (HittableIslandObject target : hittables) {
                 if (actor.canHit(target) && actor.isTouching(target)) {
 
-                    // --- Publish simple events (no instanceof) ---
+                    // Publish simple events based on roles of actor/target
                     if (!actor.isGroundObject() && !actor.isFalling() && target.isFalling()) {
-                        // e.g., a laser (not ground, not falling) hits a falling coconut
                         notifyObservers("LASER_HIT_COCONUT");
                     } else if (actor == theBeach && target.isFalling()) {
                         notifyObservers("COCONUT_HIT_BEACH");
                     } else if (actor == theCrab && target.isFalling()) {
                         notifyObservers("CRAB_HIT");
+                        triggerGameOver();   // <-- stop the game & show overlay
                     }
 
-
-                    // remove visual + queue for deletion
+                    // Queue the hit target for removal
                     scheduledForRemoval.add(target);
-                    gamePane.getChildren().remove(target.getImageView());
+                    ImageView tiv = target.getImageView();
+                    if (tiv != null) gamePane.getChildren().remove(tiv);
+
+                    // If the actor is a projectile (not ground & not falling), remove it too
+                    if (!actor.isGroundObject() && !actor.isFalling()) {
+                        scheduledForRemoval.add(actor);
+                        ImageView aiv = actor.getImageView();
+                        if (aiv != null) gamePane.getChildren().remove(aiv);
+                    }
                 }
             }
         }
 
-        // actually remove queued objects (no instanceof)
+        // 3) Actually remove queued objects (no instanceof)
         for (IslandObject obj : scheduledForRemoval) {
             allObjects.remove(obj);
+
             if (obj.isHittable()) {
+                // Safe cast after isHittable() guard
                 hittables.remove((HittableIslandObject) obj);
             }
+
+            ImageView iv = obj.getImageView();
+            if (iv != null) gamePane.getChildren().remove(iv);
         }
         scheduledForRemoval.clear();
     }
 
-    public boolean done() { return coconutsInFlight == 0 && gameTick >= MAX_TIME; }
+    //create a laser at the crab's eye line and attach it to the world + pane
+    public void fireLaser() {
+        if (theCrab == null) return;
 
-    // ---- Getters ----
-    public Crab getCrab() { return theCrab; }
+        // Fire from the crab’s “eyes” (slightly above its top)
+        int eyeY     = theCrab.y - 6; // y is protected in IslandObject (same package)
+        int centerX  = theCrab.centerX();
+
+        LaserBeam beam = new LaserBeam(this, eyeY, centerX);
+        registerObject(beam);
+        ImageView iv = beam.getImageView();
+        if (iv != null) gamePane.getChildren().add(iv);
+    }
+
+    //called by objects that want to be removed at the end of the tick
+    public void scheduleForDeletion(IslandObject obj) {
+        scheduledForRemoval.add(obj);
+    }
+
+    //Show big final scoreboard
+    public void showFinalScore() {
+        if (scoreboard != null && gamePane != null) {
+            scoreboard.showFinalOn(gamePane);
+        }
+    }
+
+    //Level done: no coconuts left and time limit reached
+    public boolean done() {
+        return coconutsInFlight == 0 && gameTick >= MAX_TIME;
+    }
+
+    // ------------------------------------------------------------------------
+    // Internal helpers
+    // ------------------------------------------------------------------------
+    /** Add object to world lists (and hittables if applicable). */
+    private void registerObject(IslandObject object) {
+        allObjects.add(object);
+        if (object.isHittable()) {
+            HittableIslandObject asHittable = (HittableIslandObject) object;
+            hittables.add(asHittable);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Getters used by others
+    // ------------------------------------------------------------------------
     public int getHeight() { return height; }
-    public int getWidth() { return width; }
+    public int getWidth()  { return width;  }
+    public Crab getCrab()  { return theCrab; }
+
+    //count when a coconut is removed from play
+    public void coconutDestroyed() { coconutsInFlight -= 1; }
 }
